@@ -70,6 +70,30 @@ que le paiement reste attribuable à la personne qui paie (pas de compte de serv
 
 ---
 
+## Dépendances
+
+> **Légende** — 🔴 indispensable (le service ne démarre pas ou ne sert à rien) ·
+> 🟠 nécessaire à une fonctionnalité (le reste continue de marcher) ·
+> 🟡 optionnelle (dégradation silencieuse, journalisée)
+
+| Dépendance | Type | Conséquence si absente |
+|---|---|---|
+| **PostgreSQL** (`payment-db`) | 🔴 | Le service ne démarre pas |
+| **Stripe** (externe) | 🟡 | Sans clé (ou avec une valeur `placeholder`), une **passerelle factice** prend automatiquement le relais : le parcours de paiement reste entièrement démontrable hors-ligne |
+| **auth-service** | 🟠 | Aucun appel réseau, mais toutes les routes exigent un jeton valide |
+
+**Aucun appel sortant vers un autre service Good Food.** Ce service est appelé,
+il n'appelle personne.
+
+### Qui dépend de ce service
+
+| Service | Type | Conséquence si `payment-service` est arrêté |
+|---|---|---|
+| `order-service` | 🟠 | Le paiement et la confirmation de commande échouent (`502`) ; le reste des commandes fonctionne |
+| `web-app` | 🟠 | Le bouton « Payer » échoue ; la navigation et l'historique restent utilisables |
+
+---
+
 ## Lancement
 
 ```bash
