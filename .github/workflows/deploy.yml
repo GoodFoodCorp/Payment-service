@@ -3,7 +3,7 @@ name: CI Docker payment-service
 on:
   push:
     branches:
-      - deploy-automated
+      - develop
 
 jobs:
   build:
