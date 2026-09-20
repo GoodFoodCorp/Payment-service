@@ -25,12 +25,13 @@ func (a Actor) HasRole(slug string) bool {
 const RoleAdmin = "admin"
 
 type UseCases struct {
-	payments domain.PaymentRepository
-	gateway  domain.PaymentGateway
+	payments       domain.PaymentRepository
+	gateway        domain.PaymentGateway
+	paymentMethods domain.PaymentMethodRepository
 }
 
-func NewUseCases(payments domain.PaymentRepository, gateway domain.PaymentGateway) *UseCases {
-	return &UseCases{payments: payments, gateway: gateway}
+func NewUseCases(payments domain.PaymentRepository, gateway domain.PaymentGateway, paymentMethods domain.PaymentMethodRepository) *UseCases {
+	return &UseCases{payments: payments, gateway: gateway, paymentMethods: paymentMethods}
 }
 
 type CreateIntentInput struct {
@@ -108,4 +109,44 @@ func (uc *UseCases) GetPayment(ctx context.Context, actor Actor, orderID string)
 		return nil, domain.NewForbiddenError("you are not allowed to view this payment")
 	}
 	return payment, nil
+}
+
+// ListMyPayments returns the caller's own payment history.
+func (uc *UseCases) ListMyPayments(ctx context.Context, actor Actor) ([]domain.Payment, error) {
+	return uc.payments.ListByCustomer(ctx, actor.UserID)
+}
+
+// ListMyPaymentMethods returns the caller's saved cards.
+func (uc *UseCases) ListMyPaymentMethods(ctx context.Context, actor Actor) ([]domain.PaymentMethod, error) {
+	return uc.paymentMethods.ListByCustomer(ctx, actor.UserID)
+}
+
+// AddPaymentMethod saves a new card for the caller (demo mode — see
+// domain.NewPaymentMethod for what is and isn't stored).
+func (uc *UseCases) AddPaymentMethod(ctx context.Context, actor Actor, in domain.PaymentMethodInput) (*domain.PaymentMethod, error) {
+	method, err := domain.NewPaymentMethod(actor.UserID, in)
+	if err != nil {
+		return nil, err
+	}
+	if method.IsDefault {
+		if err := uc.paymentMethods.ClearDefault(ctx, actor.UserID); err != nil {
+			return nil, err
+		}
+	}
+	if err := uc.paymentMethods.Create(ctx, method); err != nil {
+		return nil, err
+	}
+	return method, nil
+}
+
+// DeletePaymentMethod removes one of the caller's own saved cards.
+func (uc *UseCases) DeletePaymentMethod(ctx context.Context, actor Actor, id string) error {
+	method, err := uc.paymentMethods.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !method.IsOwnedBy(actor.UserID) {
+		return domain.NewForbiddenError("this payment method belongs to another user")
+	}
+	return uc.paymentMethods.Delete(ctx, id)
 }
