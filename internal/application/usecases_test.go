@@ -34,6 +34,63 @@ func (f *fakeRepo) Update(_ context.Context, p *domain.Payment) error {
 	return nil
 }
 
+func (f *fakeRepo) ListByCustomer(_ context.Context, customerID string) ([]domain.Payment, error) {
+	out := []domain.Payment{}
+	for _, p := range f.byOrder {
+		if p.CustomerID == customerID {
+			out = append(out, *p)
+		}
+	}
+	return out, nil
+}
+
+type fakePaymentMethods struct {
+	items map[string]*domain.PaymentMethod
+}
+
+func newFakePaymentMethods() *fakePaymentMethods {
+	return &fakePaymentMethods{items: map[string]*domain.PaymentMethod{}}
+}
+
+func (f *fakePaymentMethods) ListByCustomer(_ context.Context, customerID string) ([]domain.PaymentMethod, error) {
+	out := []domain.PaymentMethod{}
+	for _, m := range f.items {
+		if m.CustomerID == customerID {
+			out = append(out, *m)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakePaymentMethods) GetByID(_ context.Context, id string) (*domain.PaymentMethod, error) {
+	m, ok := f.items[id]
+	if !ok {
+		return nil, domain.NewNotFoundError("payment method not found")
+	}
+	cp := *m
+	return &cp, nil
+}
+
+func (f *fakePaymentMethods) Create(_ context.Context, m *domain.PaymentMethod) error {
+	cp := *m
+	f.items[m.ID] = &cp
+	return nil
+}
+
+func (f *fakePaymentMethods) Delete(_ context.Context, id string) error {
+	delete(f.items, id)
+	return nil
+}
+
+func (f *fakePaymentMethods) ClearDefault(_ context.Context, customerID string) error {
+	for _, m := range f.items {
+		if m.CustomerID == customerID {
+			m.IsDefault = false
+		}
+	}
+	return nil
+}
+
 type fakeGateway struct {
 	status      string
 	createCalls int
@@ -59,7 +116,7 @@ var (
 func setup() (*UseCases, *fakeRepo, *fakeGateway) {
 	repo := newFakeRepo()
 	gw := &fakeGateway{}
-	return NewUseCases(repo, gw), repo, gw
+	return NewUseCases(repo, gw, newFakePaymentMethods()), repo, gw
 }
 
 func TestCreateIntentIsIdempotent(t *testing.T) {
@@ -145,4 +202,64 @@ func TestCreateIntentRefusedOnAlreadyPaidOrder(t *testing.T) {
 	var derr *domain.Error
 	require.ErrorAs(t, err, &derr)
 	assert.Equal(t, domain.ErrCodeConflict, derr.Code)
+}
+
+func TestAddPaymentMethodDerivesBrandAndLast4(t *testing.T) {
+	uc, _, _ := setup()
+	method, err := uc.AddPaymentMethod(context.Background(), customer, domain.PaymentMethodInput{
+		CardholderName: "Marie Dupont", CardNumber: "4242 4242 4242 4242", ExpMonth: 12, ExpYear: 2030, IsDefault: true,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "Visa", method.Brand)
+	assert.Equal(t, "4242", method.Last4)
+
+	list, err := uc.ListMyPaymentMethods(context.Background(), customer)
+	require.NoError(t, err)
+	assert.Len(t, list, 1)
+}
+
+func TestOnlyOneDefaultPaymentMethod(t *testing.T) {
+	uc, _, _ := setup()
+	_, err := uc.AddPaymentMethod(context.Background(), customer, domain.PaymentMethodInput{
+		CardholderName: "Marie Dupont", CardNumber: "4242424242424242", ExpMonth: 12, ExpYear: 2030, IsDefault: true,
+	})
+	require.NoError(t, err)
+	_, err = uc.AddPaymentMethod(context.Background(), customer, domain.PaymentMethodInput{
+		CardholderName: "Marie Dupont", CardNumber: "5555555555554444", ExpMonth: 6, ExpYear: 2031, IsDefault: true,
+	})
+	require.NoError(t, err)
+
+	list, _ := uc.ListMyPaymentMethods(context.Background(), customer)
+	defaults := 0
+	for _, m := range list {
+		if m.IsDefault {
+			defaults++
+		}
+	}
+	assert.Equal(t, 1, defaults, "adding a new default clears the previous one")
+}
+
+func TestDeletePaymentMethodOwnershipCheck(t *testing.T) {
+	uc, _, _ := setup()
+	method, err := uc.AddPaymentMethod(context.Background(), customer, domain.PaymentMethodInput{
+		CardholderName: "Marie Dupont", CardNumber: "4242424242424242", ExpMonth: 12, ExpYear: 2030,
+	})
+	require.NoError(t, err)
+
+	err = uc.DeletePaymentMethod(context.Background(), other, method.ID)
+	var derr *domain.Error
+	require.ErrorAs(t, err, &derr)
+	assert.Equal(t, domain.ErrCodeForbidden, derr.Code)
+
+	require.NoError(t, uc.DeletePaymentMethod(context.Background(), customer, method.ID))
+}
+
+func TestAddPaymentMethodRejectsExpiredCard(t *testing.T) {
+	uc, _, _ := setup()
+	_, err := uc.AddPaymentMethod(context.Background(), customer, domain.PaymentMethodInput{
+		CardholderName: "Marie Dupont", CardNumber: "4242424242424242", ExpMonth: 1, ExpYear: 2000,
+	})
+	var derr *domain.Error
+	require.ErrorAs(t, err, &derr)
+	assert.Equal(t, domain.ErrCodeValidation, derr.Code)
 }

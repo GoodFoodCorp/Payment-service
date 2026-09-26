@@ -34,6 +34,26 @@ func (r *PaymentRepository) GetByOrderID(ctx context.Context, orderID string) (*
 	return &p, nil
 }
 
+func (r *PaymentRepository) ListByCustomer(ctx context.Context, customerID string) ([]domain.Payment, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT `+cols+` FROM payments WHERE customer_id = $1 ORDER BY created_at DESC`, customerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	list := []domain.Payment{}
+	for rows.Next() {
+		var p domain.Payment
+		if err := rows.Scan(&p.ID, &p.OrderID, &p.CustomerID, &p.StripeIntentID, &p.Status,
+			&p.AmountCents, &p.Currency, &p.PaidAt, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		list = append(list, p)
+	}
+	return list, rows.Err()
+}
+
 func (r *PaymentRepository) Create(ctx context.Context, p *domain.Payment) error {
 	_, err := r.pool.Exec(ctx,
 		`INSERT INTO payments (`+cols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
