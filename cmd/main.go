@@ -46,6 +46,7 @@ func main() {
 	uc := application.NewUseCases(
 		postgres.NewPaymentRepository(pool),
 		stripe.NewGateway(cfg.StripeSecretKey),
+		postgres.NewPaymentMethodRepository(pool),
 	)
 
 	router := httpadapter.NewRouter(

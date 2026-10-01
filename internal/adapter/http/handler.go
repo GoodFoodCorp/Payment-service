@@ -26,15 +26,6 @@ type createIntentRequest struct {
 	Currency    string `json:"currency"`
 }
 
-type paymentMethodRequest struct {
-	ProviderPaymentMethodID string `json:"provider_payment_method_id"`
-	Brand string `json:"brand"`
-	Last4 string `json:"last4"`
-	ExpiryMonth int `json:"expiry_month"`
-	ExpiryYear int `json:"expiry_year"`
-	IsDefault bool `json:"is_default"`
-}
-
 type paymentResponse struct {
 	ID           string     `json:"id"`
 	OrderID      string     `json:"order_id"`
@@ -49,6 +40,32 @@ type paymentResponse struct {
 type errorResponse struct {
 	Error     string `json:"error"`
 	RequestID string `json:"request_id,omitempty"`
+}
+
+type paymentMethodRequest struct {
+	CardholderName string `json:"cardholder_name"`
+	CardNumber     string `json:"card_number"`
+	ExpMonth       int    `json:"exp_month"`
+	ExpYear        int    `json:"exp_year"`
+	IsDefault      bool   `json:"is_default"`
+}
+
+type paymentMethodResponse struct {
+	ID             string    `json:"id"`
+	CardholderName string    `json:"cardholder_name"`
+	Brand          string    `json:"brand"`
+	Last4          string    `json:"last4"`
+	ExpMonth       int       `json:"exp_month"`
+	ExpYear        int       `json:"exp_year"`
+	IsDefault      bool      `json:"is_default"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+func toPaymentMethodResponse(m *domain.PaymentMethod) paymentMethodResponse {
+	return paymentMethodResponse{
+		ID: m.ID, CardholderName: m.CardholderName, Brand: m.Brand, Last4: m.Last4,
+		ExpMonth: m.ExpMonth, ExpYear: m.ExpYear, IsDefault: m.IsDefault, CreatedAt: m.CreatedAt,
+	}
 }
 
 func toResponse(p *domain.Payment, clientSecret string) paymentResponse {
@@ -103,24 +120,61 @@ func (h *PaymentHandler) GetByOrder(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toResponse(payment, ""))
 }
 
-func (h *PaymentHandler) ListPaymentMethods(w http.ResponseWriter, r *http.Request) {
-	items, err := h.uc.ListPaymentMethods(r.Context(), actorFrom(r))
-	if err != nil { writeDomainError(w, r, err); return }
-	writeJSON(w, http.StatusOK, items)
+// GET /api/payments/me  (the caller's own payment history)
+func (h *PaymentHandler) ListMine(w http.ResponseWriter, r *http.Request) {
+	list, err := h.uc.ListMyPayments(r.Context(), actorFrom(r))
+	if err != nil {
+		writeDomainError(w, r, err)
+		return
+	}
+	out := make([]paymentResponse, 0, len(list))
+	for i := range list {
+		out = append(out, toResponse(&list[i], ""))
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
-func (h *PaymentHandler) AddPaymentMethod(w http.ResponseWriter, r *http.Request) {
+// GET /api/payments/methods
+func (h *PaymentHandler) ListMethods(w http.ResponseWriter, r *http.Request) {
+	list, err := h.uc.ListMyPaymentMethods(r.Context(), actorFrom(r))
+	if err != nil {
+		writeDomainError(w, r, err)
+		return
+	}
+	out := make([]paymentMethodResponse, 0, len(list))
+	for i := range list {
+		out = append(out, toPaymentMethodResponse(&list[i]))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// POST /api/payments/methods  (demo mode — see domain.NewPaymentMethod)
+func (h *PaymentHandler) AddMethod(w http.ResponseWriter, r *http.Request) {
 	var req paymentMethodRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil { writeError(w, r, http.StatusBadRequest, "invalid JSON body"); return }
-	actor := actorFrom(r)
-	item, err := domain.NewPaymentMethod(actor.UserID, req.ProviderPaymentMethodID, req.Brand, req.Last4, req.ExpiryMonth, req.ExpiryYear, req.IsDefault)
-	if err != nil { writeDomainError(w, r, err); return }
-	if err := h.uc.AddPaymentMethod(r.Context(), actor, item); err != nil { writeDomainError(w, r, err); return }
-	writeJSON(w, http.StatusCreated, item)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	method, err := h.uc.AddPaymentMethod(r.Context(), actorFrom(r), domain.PaymentMethodInput{
+		CardholderName: req.CardholderName,
+		CardNumber:     req.CardNumber,
+		ExpMonth:       req.ExpMonth,
+		ExpYear:        req.ExpYear,
+		IsDefault:      req.IsDefault,
+	})
+	if err != nil {
+		writeDomainError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, toPaymentMethodResponse(method))
 }
 
-func (h *PaymentHandler) DeletePaymentMethod(w http.ResponseWriter, r *http.Request) {
-	if err := h.uc.DeletePaymentMethod(r.Context(), actorFrom(r), chi.URLParam(r, "id")); err != nil { writeDomainError(w, r, err); return }
+// DELETE /api/payments/methods/{id}
+func (h *PaymentHandler) DeleteMethod(w http.ResponseWriter, r *http.Request) {
+	if err := h.uc.DeletePaymentMethod(r.Context(), actorFrom(r), chi.URLParam(r, "id")); err != nil {
+		writeDomainError(w, r, err)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

@@ -36,11 +36,12 @@ func NewRouter(handler *PaymentHandler, jwtSecret string, log zerolog.Logger, db
 	r.Route("/api/payments", func(r chi.Router) {
 		r.Use(Auth(jwtSecret))
 		r.Post("/intents", handler.CreateIntent)
+		r.Get("/me", handler.ListMine)
+		r.Get("/methods", handler.ListMethods)
+		r.Post("/methods", handler.AddMethod)
+		r.Delete("/methods/{id}", handler.DeleteMethod)
 		r.Post("/{orderId}/confirm", handler.Confirm)
 		r.Get("/{orderId}", handler.GetByOrder)
-		r.Get("/methods", handler.ListPaymentMethods)
-		r.Post("/methods", handler.AddPaymentMethod)
-		r.Delete("/methods/{id}", handler.DeletePaymentMethod)
 	})
 
 	return r

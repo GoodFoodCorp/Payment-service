@@ -96,6 +96,8 @@ func (p *Payment) IsOwnedBy(customerID string) bool { return p.CustomerID == cus
 
 type PaymentRepository interface {
 	GetByOrderID(ctx context.Context, orderID string) (*Payment, error)
+	// ListByCustomer returns a customer's payment history, most recent first.
+	ListByCustomer(ctx context.Context, customerID string) ([]Payment, error)
 	Create(ctx context.Context, payment *Payment) error
 	Update(ctx context.Context, payment *Payment) error
 }
