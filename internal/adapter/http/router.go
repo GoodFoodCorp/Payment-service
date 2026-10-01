@@ -38,6 +38,9 @@ func NewRouter(handler *PaymentHandler, jwtSecret string, log zerolog.Logger, db
 		r.Post("/intents", handler.CreateIntent)
 		r.Post("/{orderId}/confirm", handler.Confirm)
 		r.Get("/{orderId}", handler.GetByOrder)
+		r.Get("/methods", handler.ListPaymentMethods)
+		r.Post("/methods", handler.AddPaymentMethod)
+		r.Delete("/methods/{id}", handler.DeletePaymentMethod)
 	})
 
 	return r

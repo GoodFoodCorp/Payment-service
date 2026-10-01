@@ -27,10 +27,36 @@ const RoleAdmin = "admin"
 type UseCases struct {
 	payments domain.PaymentRepository
 	gateway  domain.PaymentGateway
+	methods  interface {
+		ListPaymentMethods(context.Context, string) ([]domain.PaymentMethod, error)
+		CreatePaymentMethod(context.Context, *domain.PaymentMethod) error
+		DeletePaymentMethod(context.Context, string, string) error
+	}
 }
 
 func NewUseCases(payments domain.PaymentRepository, gateway domain.PaymentGateway) *UseCases {
-	return &UseCases{payments: payments, gateway: gateway}
+	methods, _ := payments.(interface {
+		ListPaymentMethods(context.Context, string) ([]domain.PaymentMethod, error)
+		CreatePaymentMethod(context.Context, *domain.PaymentMethod) error
+		DeletePaymentMethod(context.Context, string, string) error
+	})
+	return &UseCases{payments: payments, gateway: gateway, methods: methods}
+}
+
+func (uc *UseCases) ListPaymentMethods(ctx context.Context, actor Actor) ([]domain.PaymentMethod, error) {
+	if uc.methods == nil { return nil, domain.NewGatewayError("payment methods unavailable") }
+	return uc.methods.ListPaymentMethods(ctx, actor.UserID)
+}
+
+func (uc *UseCases) AddPaymentMethod(ctx context.Context, actor Actor, item *domain.PaymentMethod) error {
+	if uc.methods == nil { return domain.NewGatewayError("payment methods unavailable") }
+	if item.CustomerID != actor.UserID { return domain.NewForbiddenError("invalid customer") }
+	return uc.methods.CreatePaymentMethod(ctx, item)
+}
+
+func (uc *UseCases) DeletePaymentMethod(ctx context.Context, actor Actor, id string) error {
+	if uc.methods == nil { return domain.NewGatewayError("payment methods unavailable") }
+	return uc.methods.DeletePaymentMethod(ctx, actor.UserID, id)
 }
 
 type CreateIntentInput struct {
