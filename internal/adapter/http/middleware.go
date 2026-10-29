@@ -2,7 +2,8 @@ package http
 
 import (
 	"context"
-	"fmt"
+	"crypto/sha256"
+	"crypto/subtle"
 	"net/http"
 	"strings"
 	"time"
@@ -57,8 +58,17 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
-// Auth validates the shared-secret HS256 JWT (ADR-001) and stores the Actor.
-func Auth(jwtSecret string) func(http.Handler) http.Handler {
+// JWTConfig is what an access token must match.
+type JWTConfig struct {
+	Secret   string
+	Issuer   string
+	Audience string
+}
+
+// Auth validates the HS256 access token issued by auth-service (header or
+// auth_token cookie) and stores the Actor. Refresh tokens, tokens for another
+// audience, unsigned or expired tokens are all refused.
+func Auth(cfg JWTConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			tokenString := ""
@@ -71,19 +81,17 @@ func Auth(jwtSecret string) func(http.Handler) http.Handler {
 				writeError(w, r, http.StatusUnauthorized, "missing authentication token")
 				return
 			}
-			token, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
-				if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-					return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-				}
-				return []byte(jwtSecret), nil
-			})
-			if err != nil || !token.Valid {
+			claims := jwt.MapClaims{}
+			token, err := jwt.ParseWithClaims(tokenString, claims,
+				func(*jwt.Token) (any, error) { return []byte(cfg.Secret), nil },
+				jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+				jwt.WithIssuer(cfg.Issuer),
+				jwt.WithAudience(cfg.Audience),
+				jwt.WithExpirationRequired(),
+				jwt.WithLeeway(30*time.Second),
+			)
+			if err != nil || !token.Valid || claims["typ"] != "access" {
 				writeError(w, r, http.StatusUnauthorized, "invalid or expired token")
-				return
-			}
-			claims, ok := token.Claims.(jwt.MapClaims)
-			if !ok {
-				writeError(w, r, http.StatusUnauthorized, "invalid token claims")
 				return
 			}
 			actor := application.Actor{}
@@ -102,6 +110,25 @@ func Auth(jwtSecret string) func(http.Handler) http.Handler {
 				return
 			}
 			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKeyActor, actor)))
+		})
+	}
+}
+
+// ServiceKeyHeader carries the shared secret of service-to-service calls.
+const ServiceKeyHeader = "X-Service-Key"
+
+// ServiceKey guards the /internal routes (order-service only).
+func ServiceKey(expected string) func(http.Handler) http.Handler {
+	expectedHash := sha256.Sum256([]byte(expected))
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			provided := r.Header.Get(ServiceKeyHeader)
+			providedHash := sha256.Sum256([]byte(provided))
+			if expected == "" || provided == "" || subtle.ConstantTimeCompare(expectedHash[:], providedHash[:]) != 1 {
+				writeError(w, r, http.StatusUnauthorized, "invalid or missing service key")
+				return
+			}
+			next.ServeHTTP(w, r)
 		})
 	}
 }

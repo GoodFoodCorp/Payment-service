@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -11,6 +12,9 @@ import (
 	"goodfood/payment-service/internal/application"
 	"goodfood/payment-service/internal/domain"
 )
+
+// maxBodyBytes bounds every JSON body this service reads.
+const maxBodyBytes = 64 << 10
 
 type PaymentHandler struct {
 	uc *application.UseCases
@@ -20,21 +24,25 @@ func NewPaymentHandler(uc *application.UseCases) *PaymentHandler {
 	return &PaymentHandler{uc: uc}
 }
 
-type createIntentRequest struct {
-	OrderID     string `json:"order_id"`
-	AmountCents int64  `json:"amount_cents"`
-	Currency    string `json:"currency"`
+type internalIntentRequest struct {
+	OrderID         string `json:"order_id"`
+	CustomerID      string `json:"customer_id"`
+	AmountCents     int64  `json:"amount_cents"`
+	Currency        string `json:"currency"`
+	PaymentMethodID string `json:"payment_method_id"`
 }
 
 type paymentResponse struct {
 	ID           string     `json:"id"`
 	OrderID      string     `json:"order_id"`
+	CustomerID   string     `json:"customer_id"`
 	IntentID     string     `json:"intent_id"`
 	ClientSecret string     `json:"client_secret,omitempty"`
 	Status       string     `json:"status"`
 	AmountCents  int64      `json:"amount_cents"`
 	Currency     string     `json:"currency"`
 	PaidAt       *time.Time `json:"paid_at,omitempty"`
+	RefundedAt   *time.Time `json:"refunded_at,omitempty"`
 }
 
 type errorResponse struct {
@@ -43,11 +51,8 @@ type errorResponse struct {
 }
 
 type paymentMethodRequest struct {
-	CardholderName string `json:"cardholder_name"`
-	CardNumber     string `json:"card_number"`
-	ExpMonth       int    `json:"exp_month"`
-	ExpYear        int    `json:"exp_year"`
-	IsDefault      bool   `json:"is_default"`
+	PaymentMethodID string `json:"payment_method_id"`
+	IsDefault       bool   `json:"is_default"`
 }
 
 type paymentMethodResponse struct {
@@ -72,43 +77,60 @@ func toResponse(p *domain.Payment, clientSecret string) paymentResponse {
 	return paymentResponse{
 		ID:           p.ID,
 		OrderID:      p.OrderID,
+		CustomerID:   p.CustomerID,
 		IntentID:     p.StripeIntentID,
 		ClientSecret: clientSecret,
 		Status:       string(p.Status),
 		AmountCents:  p.AmountCents,
 		Currency:     p.Currency,
 		PaidAt:       p.PaidAt,
+		RefundedAt:   p.RefundedAt,
 	}
 }
 
-// POST /api/payments/intents
-func (h *PaymentHandler) CreateIntent(w http.ResponseWriter, r *http.Request) {
-	var req createIntentRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, r, http.StatusBadRequest, "invalid JSON body")
+// ── Internal API (order-service) ────────────────────────────
+
+// POST /internal/payments/intents
+func (h *PaymentHandler) CreateIntentInternal(w http.ResponseWriter, r *http.Request) {
+	var req internalIntentRequest
+	if !decodeJSON(w, r, &req) {
 		return
 	}
-	payment, clientSecret, err := h.uc.CreateIntent(r.Context(), actorFrom(r), application.CreateIntentInput{
-		OrderID:     req.OrderID,
-		AmountCents: req.AmountCents,
-		Currency:    req.Currency,
+	out, err := h.uc.CreateIntentForOrder(r.Context(), application.OrderIntentInput{
+		OrderID:         req.OrderID,
+		CustomerID:      req.CustomerID,
+		AmountCents:     req.AmountCents,
+		Currency:        req.Currency,
+		PaymentMethodID: req.PaymentMethodID,
 	})
 	if err != nil {
 		writeDomainError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, toResponse(payment, clientSecret))
+	writeJSON(w, http.StatusCreated, toResponse(out.Payment, out.ClientSecret))
 }
 
-// POST /api/payments/{orderId}/confirm
-func (h *PaymentHandler) Confirm(w http.ResponseWriter, r *http.Request) {
-	payment, err := h.uc.ConfirmPayment(r.Context(), actorFrom(r), chi.URLParam(r, "orderId"))
+// GET /internal/payments/{orderId}  (reconciled with the provider)
+func (h *PaymentHandler) SyncInternal(w http.ResponseWriter, r *http.Request) {
+	payment, err := h.uc.SyncPayment(r.Context(), chi.URLParam(r, "orderId"))
 	if err != nil {
 		writeDomainError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, toResponse(payment, ""))
 }
+
+// POST /internal/payments/{orderId}/refund
+func (h *PaymentHandler) RefundInternal(w http.ResponseWriter, r *http.Request) {
+	payment, err := h.uc.RefundOrder(r.Context(), chi.URLParam(r, "orderId"))
+	if err != nil {
+		writeDomainError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toResponse(payment, ""))
+}
+
+// ── Public API (customers) ──────────────────────────────────
 
 // GET /api/payments/{orderId}
 func (h *PaymentHandler) GetByOrder(w http.ResponseWriter, r *http.Request) {
@@ -120,9 +142,11 @@ func (h *PaymentHandler) GetByOrder(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toResponse(payment, ""))
 }
 
-// GET /api/payments/me  (the caller's own payment history)
+// GET /api/payments/me?limit=&offset=  (the caller's own payment history)
 func (h *PaymentHandler) ListMine(w http.ResponseWriter, r *http.Request) {
-	list, err := h.uc.ListMyPayments(r.Context(), actorFrom(r))
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+	list, err := h.uc.ListMyPayments(r.Context(), actorFrom(r), application.NormalizePage(limit, offset))
 	if err != nil {
 		writeDomainError(w, r, err)
 		return
@@ -148,19 +172,25 @@ func (h *PaymentHandler) ListMethods(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// POST /api/payments/methods  (demo mode — see domain.NewPaymentMethod)
+// POST /api/payments/methods/setup-intent
+func (h *PaymentHandler) CreateCardSetup(w http.ResponseWriter, r *http.Request) {
+	secret, err := h.uc.CreateCardSetup(r.Context(), actorFrom(r))
+	if err != nil {
+		writeDomainError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{"client_secret": secret})
+}
+
+// POST /api/payments/methods  {payment_method_id, is_default}
 func (h *PaymentHandler) AddMethod(w http.ResponseWriter, r *http.Request) {
 	var req paymentMethodRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, r, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	method, err := h.uc.AddPaymentMethod(r.Context(), actorFrom(r), domain.PaymentMethodInput{
-		CardholderName: req.CardholderName,
-		CardNumber:     req.CardNumber,
-		ExpMonth:       req.ExpMonth,
-		ExpYear:        req.ExpYear,
-		IsDefault:      req.IsDefault,
+		ProviderPaymentMethodID: req.PaymentMethodID,
+		IsDefault:               req.IsDefault,
 	})
 	if err != nil {
 		writeDomainError(w, r, err)
@@ -179,6 +209,14 @@ func (h *PaymentHandler) DeleteMethod(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── JSON helpers ────────────────────────────────────────────
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(v); err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid JSON body")
+		return false
+	}
+	return true
+}
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")

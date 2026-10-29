@@ -58,15 +58,57 @@ frère, sans toucher aux règles métier.
 
 ## Endpoints
 
+### Routes publiques (JWT access token)
+
 | Méthode | Route | Accès |
 |---|---|---|
-| POST | `/api/payments/intents` | authentifié (appelé par `order-service`) |
-| POST | `/api/payments/{orderId}/confirm` | propriétaire, `admin` |
+| GET | `/api/payments/me?limit=&offset=` | le client (historique paginé, 50 par défaut, 200 max) |
 | GET | `/api/payments/{orderId}` | propriétaire, `admin` |
+| GET | `/api/payments/methods` | le client (cartes enregistrées) |
+| POST | `/api/payments/methods/setup-intent` | le client — renvoie le `client_secret` d'un SetupIntent |
+| POST | `/api/payments/methods` | le client — `{payment_method_id, is_default}` après confirmation du SetupIntent |
+| DELETE | `/api/payments/methods/{id}` | propriétaire (détachée aussi chez Stripe) |
+| POST | `/api/payments/webhooks/stripe` | Stripe — authentifié par l'en-tête `Stripe-Signature` |
 | GET | `/healthz`, `/readyz` | public (sondes) |
 
-**Appel depuis `order-service`** : le JWT du client est transmis tel quel, pour
-que le paiement reste attribuable à la personne qui paie (pas de compte de service).
+**Un client ne peut ni créer ni confirmer un paiement** : il n'existe aucune
+route publique pour le faire. Le montant est toujours celui calculé par
+`order-service` à partir du catalogue.
+
+### Routes internes (`X-Service-Key`, jamais exposées par l'ingress)
+
+| Méthode | Route | Usage |
+|---|---|---|
+| POST | `/internal/payments/intents` | `order-service` crée/reprend le paiement : `{order_id, customer_id, amount_cents, currency, payment_method_id?}` |
+| GET | `/internal/payments/{orderId}` | état du paiement **réconcilié avec Stripe** (confirmation de commande) |
+| POST | `/internal/payments/{orderId}/refund` | remboursement (commande payée) ou annulation de l'intention (non payée), idempotent |
+
+### Événements publiés (RabbitMQ `goodfood.events`, via outbox)
+
+| Routing key | Quand |
+|---|---|
+| `payment.succeeded` | paiement confirmé (webhook ou réconciliation) |
+| `payment.failed` | tentative refusée (le client peut réessayer) |
+| `payment.refunded` | remboursement effectué (y compris depuis le dashboard Stripe) |
+
+Les événements sont écrits dans la table `outbox_events` **dans la même
+transaction** que le changement de statut, puis relayés (au moins une fois) par
+un worker qui verrouille les lignes en `FOR UPDATE SKIP LOCKED` : plusieurs
+réplicas peuvent tourner sans doublon concurrent.
+
+### Cartes enregistrées (PCI-DSS)
+
+Le numéro de carte ne traverse jamais nos serveurs : le navigateur confirme un
+**SetupIntent** avec Stripe Elements, puis envoie uniquement l'identifiant
+`pm_…`. Le service vérifie auprès de Stripe que cette carte est bien rattachée
+au client Stripe de l'appelant avant de l'enregistrer. En mode factice, les
+identifiants de test Stripe (`pm_card_visa`, `pm_card_mastercard`,
+`pm_card_amex`) sont acceptés.
+
+### Statuts d'un paiement
+
+`PENDING` → `SUCCEEDED` → `REFUNDED`, ou `PENDING` ⇄ `FAILED` (nouvel essai
+possible), ou `PENDING` → `CANCELED` (commande annulée avant paiement).
 
 ---
 
@@ -79,11 +121,11 @@ que le paiement reste attribuable à la personne qui paie (pas de compte de serv
 | Dépendance | Type | Conséquence si absente |
 |---|---|---|
 | **PostgreSQL** (`payment-db`) | 🔴 | Le service ne démarre pas |
-| **Stripe** (externe) | 🟡 | Sans clé (ou avec une valeur `placeholder`), une **passerelle factice** prend automatiquement le relais : le parcours de paiement reste entièrement démontrable hors-ligne |
-| **auth-service** | 🟠 | Aucun appel réseau, mais toutes les routes exigent un jeton valide |
+| **Stripe** (externe) | 🔴 en production | Hors production, sans clé, une **passerelle factice** approuve tout paiement (démo hors-ligne). Elle est **refusée au démarrage** si `ENV=production` |
+| **RabbitMQ** | 🟡 | Les événements restent dans l'outbox et partent au retour du broker |
+| **auth-service** | 🟠 | Aucun appel réseau, mais toutes les routes publiques exigent un jeton valide |
 
-**Aucun appel sortant vers un autre service Good Food.** Ce service est appelé,
-il n'appelle personne.
+**Aucun appel sortant vers un autre service Good Food.**
 
 ### Qui dépend de ce service
 
@@ -111,28 +153,26 @@ docker compose up -d --build
 | `PORT` | non (8086) | Port HTTP |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | oui | Base dédiée `payment-db` |
 | `DATABASE_URL` | oui | Chaîne pgx (le compose la construit pour le conteneur) |
-| `JWT_SECRET` | oui | Secret HS256 partagé avec `auth-service` |
-| `STRIPE_SECRET_KEY` | non | Clé test `sk_test_…` ; **vide → passerelle factice** |
+| `ENV` | non (`development`) | `production` interdit la passerelle factice et exige le secret de webhook |
+| `JWT_SECRET` | oui | Secret HS256 des access tokens, partagé avec `auth-service` |
+| `JWT_ISSUER` / `JWT_AUDIENCE` | non | Défauts `goodfood-auth` / `goodfood-api` |
+| `SERVICE_API_KEY` | oui | Clé `X-Service-Key` des routes `/internal` |
+| `PAYMENT_GATEWAY` | non | `stripe` ou `fake` (défaut : `stripe` si une clé est fournie) |
+| `STRIPE_SECRET_KEY` | si `stripe` | Clé `sk_test_…` / `sk_live_…` |
+| `STRIPE_WEBHOOK_SECRET` | en production | Secret `whsec_…` de l'endpoint webhook |
+| `RABBITMQ_URL` | non | Relais des événements de l'outbox |
 
 ---
 
 ## Tests
 
 ```bash
-go test ./internal/... -cover     # couverture ~86 % sur la couche application
-go vet ./... && gofmt -l .
+go vet ./... && go test ./...                       # unitaires, sans dépendance
+TEST_DATABASE_URL=postgres://...   go test -tags integration ./internal/adapter/postgres/   # vraie base PostgreSQL
 ```
 
-Couvre l'idempotence, le refus du double paiement, la confirmation et les règles
-de propriété. Aucune base ni appel réseau requis.
-
-> ⚠️ **Aucune CI n'est configurée sur ce projet** — les tests doivent être lancés
-> manuellement.
-
----
-
-## Note de production
-
-En production, la confirmation devrait être pilotée par un **webhook Stripe** reçu
-par ce service, et non par un appel du client après le paiement. L'endpoint de
-confirmation est conçu pour accueillir ce basculement sans changer le domaine.
+Couvre : montant imposé par `order-service`, reprise idempotente d'une intention
+(avec son `client_secret`), réalignement du montant, remboursement unique,
+annulation d'une intention non payée, webhooks (signature, rejeu, événements),
+cartes rattachées au bon client Stripe, configuration refusée en production,
+rejet des refresh tokens et des routes internes sans clé, outbox transactionnelle.
