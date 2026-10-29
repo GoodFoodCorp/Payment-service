@@ -10,256 +10,318 @@ import (
 	"goodfood/payment-service/internal/domain"
 )
 
-type fakeRepo struct{ byOrder map[string]*domain.Payment }
-
-func newFakeRepo() *fakeRepo { return &fakeRepo{byOrder: map[string]*domain.Payment{}} }
-
-func (f *fakeRepo) GetByOrderID(_ context.Context, orderID string) (*domain.Payment, error) {
-	p, ok := f.byOrder[orderID]
-	if !ok {
-		return nil, domain.NewNotFoundError("payment not found for this order")
-	}
-	cp := *p
-	return &cp, nil
-}
-
-func (f *fakeRepo) Create(_ context.Context, p *domain.Payment) error {
-	cp := *p
-	f.byOrder[p.OrderID] = &cp
-	return nil
-}
-
-func (f *fakeRepo) Update(_ context.Context, p *domain.Payment) error {
-	f.byOrder[p.OrderID] = p
-	return nil
-}
-
-func (f *fakeRepo) ListByCustomer(_ context.Context, customerID string) ([]domain.Payment, error) {
-	out := []domain.Payment{}
-	for _, p := range f.byOrder {
-		if p.CustomerID == customerID {
-			out = append(out, *p)
-		}
-	}
-	return out, nil
-}
-
-type fakePaymentMethods struct {
-	items map[string]*domain.PaymentMethod
-}
-
-func newFakePaymentMethods() *fakePaymentMethods {
-	return &fakePaymentMethods{items: map[string]*domain.PaymentMethod{}}
-}
-
-func (f *fakePaymentMethods) ListByCustomer(_ context.Context, customerID string) ([]domain.PaymentMethod, error) {
-	out := []domain.PaymentMethod{}
-	for _, m := range f.items {
-		if m.CustomerID == customerID {
-			out = append(out, *m)
-		}
-	}
-	return out, nil
-}
-
-func (f *fakePaymentMethods) GetByID(_ context.Context, id string) (*domain.PaymentMethod, error) {
-	m, ok := f.items[id]
-	if !ok {
-		return nil, domain.NewNotFoundError("payment method not found")
-	}
-	cp := *m
-	return &cp, nil
-}
-
-func (f *fakePaymentMethods) Create(_ context.Context, m *domain.PaymentMethod) error {
-	cp := *m
-	f.items[m.ID] = &cp
-	return nil
-}
-
-func (f *fakePaymentMethods) Delete(_ context.Context, id string) error {
-	delete(f.items, id)
-	return nil
-}
-
-func (f *fakePaymentMethods) ClearDefault(_ context.Context, customerID string) error {
-	for _, m := range f.items {
-		if m.CustomerID == customerID {
-			m.IsDefault = false
-		}
-	}
-	return nil
-}
-
-type fakeGateway struct {
-	status      string
-	createCalls int
-}
-
-func (f *fakeGateway) CreateIntent(_ context.Context, _ int64, _, orderID string) (*domain.PaymentIntent, error) {
-	f.createCalls++
-	return &domain.PaymentIntent{ID: "pi_" + orderID, ClientSecret: "secret"}, nil
-}
-
-func (f *fakeGateway) GetIntentStatus(_ context.Context, _ string) (string, error) {
-	if f.status == "" {
-		return "succeeded", nil
-	}
-	return f.status, nil
-}
-
 var (
 	customer = Actor{UserID: "cust-1", RoleSlugs: []string{"user"}}
 	other    = Actor{UserID: "cust-2", RoleSlugs: []string{"user"}}
+	ctx      = context.Background()
 )
 
-func setup() (*UseCases, *fakeRepo, *fakeGateway) {
-	repo := newFakeRepo()
-	gw := &fakeGateway{}
-	return NewUseCases(repo, gw, newFakePaymentMethods()), repo, gw
+type fixture struct {
+	uc      *UseCases
+	repo    *fakeRepo
+	gw      *fakeGateway
+	methods *fakePaymentMethods
 }
 
-func TestCreateIntentIsIdempotent(t *testing.T) {
-	uc, _, gw := setup()
-	in := CreateIntentInput{OrderID: "order-1", AmountCents: 2598}
-
-	first, secret, err := uc.CreateIntent(context.Background(), customer, in)
-	require.NoError(t, err)
-	assert.Equal(t, domain.StatusPending, first.Status)
-	assert.Equal(t, "secret", secret)
-	assert.Equal(t, int64(2598), first.AmountCents)
-	assert.Equal(t, "eur", first.Currency, "currency defaults to eur")
-
-	second, _, err := uc.CreateIntent(context.Background(), customer, in)
-	require.NoError(t, err)
-	assert.Equal(t, first.ID, second.ID)
-	assert.Equal(t, 1, gw.createCalls, "the provider is called only once")
+func setup() fixture {
+	f := fixture{repo: newFakeRepo(), gw: newFakeGateway(), methods: newFakePaymentMethods()}
+	f.uc = NewUseCases(f.repo, f.gw, f.methods, &fakeCustomers{ids: map[string]string{}})
+	return f
 }
 
-func TestCreateIntentRejectsInvalidAmount(t *testing.T) {
-	uc, _, _ := setup()
-	_, _, err := uc.CreateIntent(context.Background(), customer,
-		CreateIntentInput{OrderID: "order-1", AmountCents: 0})
+func intentFor(orderID string, amount int64) OrderIntentInput {
+	return OrderIntentInput{OrderID: orderID, CustomerID: customer.UserID, AmountCents: amount}
+}
+
+func requireCode(t *testing.T, err error, code domain.ErrorCode) {
+	t.Helper()
 	var derr *domain.Error
 	require.ErrorAs(t, err, &derr)
-	assert.Equal(t, domain.ErrCodeValidation, derr.Code)
+	assert.Equal(t, code, derr.Code)
 }
 
-func TestConfirmPaymentSuccess(t *testing.T) {
-	uc, _, _ := setup()
-	_, _, err := uc.CreateIntent(context.Background(), customer, CreateIntentInput{OrderID: "order-1", AmountCents: 1000})
+// ── Intents (order-service) ─────────────────────────────────
+
+func TestCreateIntentForOrder_ChargesTheOrderAmount(t *testing.T) {
+	f := setup()
+
+	out, err := f.uc.CreateIntentForOrder(ctx, intentFor("order-1", 2598))
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(2598), out.Payment.AmountCents)
+	assert.Equal(t, int64(2598), f.gw.lastRequest.AmountCents)
+	assert.Equal(t, "eur", out.Payment.Currency, "currency defaults to eur")
+	assert.Equal(t, "secret_order-1", out.ClientSecret)
+	assert.Equal(t, domain.StatusPending, out.Payment.Status)
+}
+
+func TestCreateIntentForOrder_ResumesPendingIntentWithItsSecret(t *testing.T) {
+	f := setup()
+	_, err := f.uc.CreateIntentForOrder(ctx, intentFor("order-1", 1000))
 	require.NoError(t, err)
 
-	paid, err := uc.ConfirmPayment(context.Background(), customer, "order-1")
+	again, err := f.uc.CreateIntentForOrder(ctx, intentFor("order-1", 1000))
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, f.gw.createCalls, "the provider intent is reused")
+	assert.NotEmpty(t, again.ClientSecret, "a retry still gets a usable client secret")
+}
+
+func TestCreateIntentForOrder_RealignsAmountOfPendingIntent(t *testing.T) {
+	f := setup()
+	_, _ = f.uc.CreateIntentForOrder(ctx, intentFor("order-1", 1000))
+
+	out, err := f.uc.CreateIntentForOrder(ctx, intentFor("order-1", 1500))
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(1500), f.gw.updatedAmount)
+	assert.Equal(t, int64(1500), out.Payment.AmountCents)
+	stored, _ := f.repo.GetByOrderID(ctx, "order-1")
+	assert.Equal(t, int64(1500), stored.AmountCents)
+}
+
+func TestCreateIntentForOrder_Validation(t *testing.T) {
+	f := setup()
+	_, err := f.uc.CreateIntentForOrder(ctx, intentFor("order-1", 0))
+	requireCode(t, err, domain.ErrCodeValidation)
+
+	_, err = f.uc.CreateIntentForOrder(ctx, OrderIntentInput{OrderID: "order-1", AmountCents: 100})
+	requireCode(t, err, domain.ErrCodeValidation)
+}
+
+func TestCreateIntentForOrder_RefusedOncePaid(t *testing.T) {
+	f := setup()
+	_, _ = f.uc.CreateIntentForOrder(ctx, intentFor("order-1", 1000))
+	f.gw.status = "succeeded"
+	_, err := f.uc.SyncPayment(ctx, "order-1")
+	require.NoError(t, err)
+
+	_, err = f.uc.CreateIntentForOrder(ctx, intentFor("order-1", 1000))
+	requireCode(t, err, domain.ErrCodeConflict)
+}
+
+func TestCreateIntentForOrder_RefusesAnotherCustomersOrder(t *testing.T) {
+	f := setup()
+	_, _ = f.uc.CreateIntentForOrder(ctx, intentFor("order-1", 1000))
+
+	_, err := f.uc.CreateIntentForOrder(ctx, OrderIntentInput{OrderID: "order-1", CustomerID: other.UserID, AmountCents: 1})
+	requireCode(t, err, domain.ErrCodeForbidden)
+}
+
+func TestCreateIntentForOrder_WithSavedCard(t *testing.T) {
+	f := setup()
+	f.gw.cards["pm_1"] = "cus_" + customer.UserID
+	method, err := f.uc.AddPaymentMethod(ctx, customer, domain.PaymentMethodInput{ProviderPaymentMethodID: "pm_1"})
+	require.NoError(t, err)
+
+	in := intentFor("order-1", 1000)
+	in.PaymentMethodID = method.ID
+	_, err = f.uc.CreateIntentForOrder(ctx, in)
+
+	require.NoError(t, err)
+	assert.Equal(t, "pm_1", f.gw.lastRequest.ProviderPaymentMethodID)
+	assert.Equal(t, "cus_"+customer.UserID, f.gw.lastRequest.ProviderCustomerID)
+}
+
+func TestCreateIntentForOrder_RefusesSomeoneElsesCard(t *testing.T) {
+	f := setup()
+	f.gw.cards["pm_1"] = "cus_" + other.UserID
+	method, err := f.uc.AddPaymentMethod(ctx, other, domain.PaymentMethodInput{ProviderPaymentMethodID: "pm_1"})
+	require.NoError(t, err)
+
+	in := intentFor("order-1", 1000)
+	in.PaymentMethodID = method.ID
+	_, err = f.uc.CreateIntentForOrder(ctx, in)
+	requireCode(t, err, domain.ErrCodeForbidden)
+}
+
+// ── Sync and refunds ────────────────────────────────────────
+
+func TestSyncPayment_PublishesSucceededOnce(t *testing.T) {
+	f := setup()
+	_, _ = f.uc.CreateIntentForOrder(ctx, intentFor("order-1", 1000))
+
+	pending, err := f.uc.SyncPayment(ctx, "order-1")
+	require.NoError(t, err)
+	assert.Equal(t, domain.StatusPending, pending.Status)
+
+	f.gw.status = "succeeded"
+	paid, err := f.uc.SyncPayment(ctx, "order-1")
 	require.NoError(t, err)
 	assert.Equal(t, domain.StatusSucceeded, paid.Status)
 	require.NotNil(t, paid.PaidAt)
 
-	// Idempotent
-	again, err := uc.ConfirmPayment(context.Background(), customer, "order-1")
+	_, err = f.uc.SyncPayment(ctx, "order-1")
 	require.NoError(t, err)
-	assert.Equal(t, domain.StatusSucceeded, again.Status)
+	assert.Equal(t, []string{domain.EventPaymentSucceeded}, f.repo.eventTypes())
 }
 
-func TestConfirmPaymentNotCompleted(t *testing.T) {
-	uc, _, gw := setup()
-	_, _, _ = uc.CreateIntent(context.Background(), customer, CreateIntentInput{OrderID: "order-1", AmountCents: 1000})
-	gw.status = "requires_payment_method"
+func TestRefundOrder_RefundsPaidOrderOnce(t *testing.T) {
+	f := setup()
+	_, _ = f.uc.CreateIntentForOrder(ctx, intentFor("order-1", 1000))
+	f.gw.status = "succeeded"
 
-	_, err := uc.ConfirmPayment(context.Background(), customer, "order-1")
-	var derr *domain.Error
-	require.ErrorAs(t, err, &derr)
-	assert.Equal(t, domain.ErrCodeGateway, derr.Code)
+	refunded, err := f.uc.RefundOrder(ctx, "order-1")
+	require.NoError(t, err)
+	assert.Equal(t, domain.StatusRefunded, refunded.Status)
+
+	_, err = f.uc.RefundOrder(ctx, "order-1")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"pi_order-1"}, f.gw.refunds, "refunded exactly once")
+	assert.Equal(t, []string{domain.EventPaymentSucceeded, domain.EventPaymentRefunded}, f.repo.eventTypes())
 }
 
-func TestOnlyOwnerCanConfirmOrView(t *testing.T) {
-	uc, _, _ := setup()
-	_, _, _ = uc.CreateIntent(context.Background(), customer, CreateIntentInput{OrderID: "order-1", AmountCents: 1000})
+func TestRefundOrder_CancelsUnpaidIntent(t *testing.T) {
+	f := setup()
+	_, _ = f.uc.CreateIntentForOrder(ctx, intentFor("order-1", 1000))
 
-	_, err := uc.ConfirmPayment(context.Background(), other, "order-1")
-	var derr *domain.Error
-	require.ErrorAs(t, err, &derr)
-	assert.Equal(t, domain.ErrCodeForbidden, derr.Code)
+	payment, err := f.uc.RefundOrder(ctx, "order-1")
 
-	_, err = uc.GetPayment(context.Background(), other, "order-1")
-	require.ErrorAs(t, err, &derr)
-	assert.Equal(t, domain.ErrCodeForbidden, derr.Code)
+	require.NoError(t, err)
+	assert.Equal(t, domain.StatusCanceled, payment.Status)
+	assert.Equal(t, []string{"pi_order-1"}, f.gw.canceled)
+	assert.Empty(t, f.gw.refunds)
+}
 
-	// Head office may inspect any payment.
-	admin := Actor{UserID: "adm", RoleSlugs: []string{RoleAdmin}}
-	_, err = uc.GetPayment(context.Background(), admin, "order-1")
+func TestRefundOrder_ProviderFailureKeepsPaymentPaid(t *testing.T) {
+	f := setup()
+	_, _ = f.uc.CreateIntentForOrder(ctx, intentFor("order-1", 1000))
+	f.gw.status = "succeeded"
+	_, _ = f.uc.SyncPayment(ctx, "order-1")
+	f.gw.failOperations = true
+
+	_, err := f.uc.RefundOrder(ctx, "order-1")
+
+	requireCode(t, err, domain.ErrCodeGateway)
+	stored, _ := f.repo.GetByOrderID(ctx, "order-1")
+	assert.Equal(t, domain.StatusSucceeded, stored.Status, "order-service retries the refund later")
+}
+
+func TestRefundOrder_UnknownOrder(t *testing.T) {
+	_, err := setup().uc.RefundOrder(ctx, "never-paid")
+	requireCode(t, err, domain.ErrCodeNotFound)
+}
+
+// ── Webhooks ────────────────────────────────────────────────
+
+func TestHandleProviderEvent(t *testing.T) {
+	f := setup()
+	_, _ = f.uc.CreateIntentForOrder(ctx, intentFor("order-1", 1000))
+
+	require.NoError(t, f.uc.HandleProviderEvent(ctx, domain.GatewayEvent{Type: domain.GatewayIntentFailed, IntentID: "pi_order-1"}))
+	failed, _ := f.repo.GetByOrderID(ctx, "order-1")
+	assert.Equal(t, domain.StatusFailed, failed.Status)
+
+	// A declined card can be retried: the intent is resumed, not refused.
+	_, err := f.uc.CreateIntentForOrder(ctx, intentFor("order-1", 1000))
+	require.NoError(t, err)
+
+	succeeded := domain.GatewayEvent{Type: domain.GatewayIntentSucceeded, IntentID: "pi_order-1"}
+	require.NoError(t, f.uc.HandleProviderEvent(ctx, succeeded))
+	require.NoError(t, f.uc.HandleProviderEvent(ctx, succeeded), "replays are harmless")
+
+	require.NoError(t, f.uc.HandleProviderEvent(ctx, domain.GatewayEvent{Type: domain.GatewayChargeRefunded, IntentID: "pi_order-1"}))
+	refunded, _ := f.repo.GetByOrderID(ctx, "order-1")
+	assert.Equal(t, domain.StatusRefunded, refunded.Status)
+
+	assert.Equal(t, []string{domain.EventPaymentFailed, domain.EventPaymentSucceeded, domain.EventPaymentRefunded}, f.repo.eventTypes())
+}
+
+func TestHandleProviderEvent_IgnoresUnknownIntent(t *testing.T) {
+	err := setup().uc.HandleProviderEvent(ctx, domain.GatewayEvent{Type: domain.GatewayIntentSucceeded, IntentID: "pi_other_platform"})
+	assert.NoError(t, err)
+}
+
+// ── Customer reads ──────────────────────────────────────────
+
+func TestOnlyOwnerOrAdminCanView(t *testing.T) {
+	f := setup()
+	_, _ = f.uc.CreateIntentForOrder(ctx, intentFor("order-1", 1000))
+
+	_, err := f.uc.GetPayment(ctx, other, "order-1")
+	requireCode(t, err, domain.ErrCodeForbidden)
+
+	_, err = f.uc.GetPayment(ctx, customer, "order-1")
+	require.NoError(t, err)
+	_, err = f.uc.GetPayment(ctx, Actor{UserID: "adm", RoleSlugs: []string{RoleAdmin}}, "order-1")
 	require.NoError(t, err)
 }
 
-func TestCreateIntentRefusedOnAlreadyPaidOrder(t *testing.T) {
-	uc, _, _ := setup()
-	in := CreateIntentInput{OrderID: "order-1", AmountCents: 1000}
-	_, _, _ = uc.CreateIntent(context.Background(), customer, in)
-	_, err := uc.ConfirmPayment(context.Background(), customer, "order-1")
-	require.NoError(t, err)
+func TestListMyPayments_IsPaginated(t *testing.T) {
+	f := setup()
+	for _, id := range []string{"order-1", "order-2", "order-3"} {
+		_, _ = f.uc.CreateIntentForOrder(ctx, intentFor(id, 1000))
+	}
 
-	_, _, err = uc.CreateIntent(context.Background(), customer, in)
-	var derr *domain.Error
-	require.ErrorAs(t, err, &derr)
-	assert.Equal(t, domain.ErrCodeConflict, derr.Code)
+	page, err := f.uc.ListMyPayments(ctx, customer, NormalizePage(2, 1))
+
+	require.NoError(t, err)
+	require.Len(t, page, 2)
+	assert.Equal(t, "order-2", page[0].OrderID)
 }
 
-func TestAddPaymentMethodDerivesBrandAndLast4(t *testing.T) {
-	uc, _, _ := setup()
-	method, err := uc.AddPaymentMethod(context.Background(), customer, domain.PaymentMethodInput{
-		CardholderName: "Marie Dupont", CardNumber: "4242 4242 4242 4242", ExpMonth: 12, ExpYear: 2030, IsDefault: true,
-	})
+func TestNormalizePage(t *testing.T) {
+	assert.Equal(t, domain.Page{Limit: DefaultPageSize}, NormalizePage(0, -3))
+	assert.Equal(t, domain.Page{Limit: MaxPageSize, Offset: 10}, NormalizePage(10_000, 10))
+}
+
+// ── Saved cards ─────────────────────────────────────────────
+
+func TestCreateCardSetup_CreatesProviderCustomerOnce(t *testing.T) {
+	f := setup()
+	secret, err := f.uc.CreateCardSetup(ctx, customer)
+	require.NoError(t, err)
+	assert.Equal(t, "seti_secret_cus_cust-1", secret)
+
+	_, err = f.uc.CreateCardSetup(ctx, customer)
+	require.NoError(t, err)
+	assert.Equal(t, 1, f.gw.customersMade)
+}
+
+func TestAddPaymentMethod_OnlyCardsOfTheCallersAccount(t *testing.T) {
+	f := setup()
+	f.gw.cards["pm_mine"] = "cus_" + customer.UserID
+	f.gw.cards["pm_theirs"] = "cus_" + other.UserID
+
+	method, err := f.uc.AddPaymentMethod(ctx, customer, domain.PaymentMethodInput{ProviderPaymentMethodID: "pm_mine", IsDefault: true})
 	require.NoError(t, err)
 	assert.Equal(t, "Visa", method.Brand)
 	assert.Equal(t, "4242", method.Last4)
 
-	list, err := uc.ListMyPaymentMethods(context.Background(), customer)
-	require.NoError(t, err)
-	assert.Len(t, list, 1)
+	_, err = f.uc.AddPaymentMethod(ctx, customer, domain.PaymentMethodInput{ProviderPaymentMethodID: "pm_theirs"})
+	requireCode(t, err, domain.ErrCodeForbidden)
+
+	_, err = f.uc.AddPaymentMethod(ctx, customer, domain.PaymentMethodInput{})
+	requireCode(t, err, domain.ErrCodeValidation)
 }
 
 func TestOnlyOneDefaultPaymentMethod(t *testing.T) {
-	uc, _, _ := setup()
-	_, err := uc.AddPaymentMethod(context.Background(), customer, domain.PaymentMethodInput{
-		CardholderName: "Marie Dupont", CardNumber: "4242424242424242", ExpMonth: 12, ExpYear: 2030, IsDefault: true,
-	})
+	f := setup()
+	f.gw.cards["pm_1"] = "cus_" + customer.UserID
+	f.gw.cards["pm_2"] = "cus_" + customer.UserID
+	_, err := f.uc.AddPaymentMethod(ctx, customer, domain.PaymentMethodInput{ProviderPaymentMethodID: "pm_1", IsDefault: true})
 	require.NoError(t, err)
-	_, err = uc.AddPaymentMethod(context.Background(), customer, domain.PaymentMethodInput{
-		CardholderName: "Marie Dupont", CardNumber: "5555555555554444", ExpMonth: 6, ExpYear: 2031, IsDefault: true,
-	})
+	_, err = f.uc.AddPaymentMethod(ctx, customer, domain.PaymentMethodInput{ProviderPaymentMethodID: "pm_2", IsDefault: true})
 	require.NoError(t, err)
 
-	list, _ := uc.ListMyPaymentMethods(context.Background(), customer)
+	list, _ := f.uc.ListMyPaymentMethods(ctx, customer)
 	defaults := 0
 	for _, m := range list {
 		if m.IsDefault {
 			defaults++
 		}
 	}
-	assert.Equal(t, 1, defaults, "adding a new default clears the previous one")
+	assert.Equal(t, 1, defaults)
 }
 
-func TestDeletePaymentMethodOwnershipCheck(t *testing.T) {
-	uc, _, _ := setup()
-	method, err := uc.AddPaymentMethod(context.Background(), customer, domain.PaymentMethodInput{
-		CardholderName: "Marie Dupont", CardNumber: "4242424242424242", ExpMonth: 12, ExpYear: 2030,
-	})
+func TestDeletePaymentMethod_OwnershipAndProviderDetach(t *testing.T) {
+	f := setup()
+	f.gw.cards["pm_1"] = "cus_" + customer.UserID
+	method, err := f.uc.AddPaymentMethod(ctx, customer, domain.PaymentMethodInput{ProviderPaymentMethodID: "pm_1"})
 	require.NoError(t, err)
 
-	err = uc.DeletePaymentMethod(context.Background(), other, method.ID)
-	var derr *domain.Error
-	require.ErrorAs(t, err, &derr)
-	assert.Equal(t, domain.ErrCodeForbidden, derr.Code)
+	requireCode(t, f.uc.DeletePaymentMethod(ctx, other, method.ID), domain.ErrCodeForbidden)
 
-	require.NoError(t, uc.DeletePaymentMethod(context.Background(), customer, method.ID))
-}
-
-func TestAddPaymentMethodRejectsExpiredCard(t *testing.T) {
-	uc, _, _ := setup()
-	_, err := uc.AddPaymentMethod(context.Background(), customer, domain.PaymentMethodInput{
-		CardholderName: "Marie Dupont", CardNumber: "4242424242424242", ExpMonth: 1, ExpYear: 2000,
-	})
-	var derr *domain.Error
-	require.ErrorAs(t, err, &derr)
-	assert.Equal(t, domain.ErrCodeValidation, derr.Code)
+	require.NoError(t, f.uc.DeletePaymentMethod(ctx, customer, method.ID))
+	assert.Equal(t, []string{"pm_1"}, f.gw.detached)
 }

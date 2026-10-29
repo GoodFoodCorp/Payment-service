@@ -8,78 +8,52 @@ import (
 	"github.com/google/uuid"
 )
 
-// PaymentMethod is a saved card. Demo mode only: the raw card number is never
-// persisted, only the brand and last 4 digits derived from it once, exactly
-// like a real processor would return — no real charge ever touches it.
+// PaymentMethod is a card saved with the provider. The browser hands the card
+// to the provider directly (SetupIntent): this service only ever sees the
+// provider's payment method id and the display details it returns, so no card
+// number crosses our infrastructure (PCI-DSS SAQ A).
 type PaymentMethod struct {
-	ID             string
-	CustomerID     string
-	CardholderName string
-	Brand          string
-	Last4          string
-	ExpMonth       int
-	ExpYear        int
-	IsDefault      bool
-	CreatedAt      time.Time
+	ID                      string
+	CustomerID              string
+	ProviderPaymentMethodID string
+	CardholderName          string
+	Brand                   string
+	Last4                   string
+	ExpMonth                int
+	ExpYear                 int
+	IsDefault               bool
+	CreatedAt               time.Time
 }
 
+// PaymentMethodInput registers a card the provider already holds.
 type PaymentMethodInput struct {
-	CardholderName string
-	CardNumber     string
-	ExpMonth       int
-	ExpYear        int
-	IsDefault      bool
+	ProviderPaymentMethodID string
+	IsDefault               bool
 }
 
-func detectBrand(digits string) string {
-	switch {
-	case strings.HasPrefix(digits, "4"):
-		return "Visa"
-	case strings.HasPrefix(digits, "5"):
-		return "Mastercard"
-	case strings.HasPrefix(digits, "34"), strings.HasPrefix(digits, "37"):
-		return "American Express"
-	default:
-		return "Carte"
-	}
-}
-
-// NewPaymentMethod validates the input and derives brand/last4 from the card
-// number — the number itself is discarded right after.
-func NewPaymentMethod(customerID string, in PaymentMethodInput) (*PaymentMethod, error) {
+// NewPaymentMethod builds a saved card from the provider's details.
+func NewPaymentMethod(customerID string, card *CardDetails, isDefault bool) (*PaymentMethod, error) {
 	if customerID == "" {
 		return nil, NewValidationError("customer id is required")
 	}
-	if strings.TrimSpace(in.CardholderName) == "" {
-		return nil, NewValidationError("cardholder name is required")
-	}
-	digits := strings.ReplaceAll(strings.ReplaceAll(in.CardNumber, " ", ""), "-", "")
-	if len(digits) < 12 || len(digits) > 19 {
-		return nil, NewValidationError("card number must be between 12 and 19 digits")
-	}
-	for _, c := range digits {
-		if c < '0' || c > '9' {
-			return nil, NewValidationError("card number must contain digits only")
-		}
-	}
-	if in.ExpMonth < 1 || in.ExpMonth > 12 {
-		return nil, NewValidationError("expiry month must be between 1 and 12")
+	if card == nil || card.ProviderID == "" {
+		return nil, NewValidationError("payment method id is required")
 	}
 	now := time.Now().UTC()
-	if in.ExpYear < now.Year() || (in.ExpYear == now.Year() && in.ExpMonth < int(now.Month())) {
+	if card.ExpYear < now.Year() || (card.ExpYear == now.Year() && card.ExpMonth < int(now.Month())) {
 		return nil, NewValidationError("card has already expired")
 	}
-
 	return &PaymentMethod{
-		ID:             uuid.NewString(),
-		CustomerID:     customerID,
-		CardholderName: strings.TrimSpace(in.CardholderName),
-		Brand:          detectBrand(digits),
-		Last4:          digits[len(digits)-4:],
-		ExpMonth:       in.ExpMonth,
-		ExpYear:        in.ExpYear,
-		IsDefault:      in.IsDefault,
-		CreatedAt:      now,
+		ID:                      uuid.NewString(),
+		CustomerID:              customerID,
+		ProviderPaymentMethodID: card.ProviderID,
+		CardholderName:          strings.TrimSpace(card.HolderName),
+		Brand:                   card.Brand,
+		Last4:                   card.Last4,
+		ExpMonth:                card.ExpMonth,
+		ExpYear:                 card.ExpYear,
+		IsDefault:               isDefault,
+		CreatedAt:               now,
 	}, nil
 }
 
@@ -89,7 +63,15 @@ func (m *PaymentMethod) IsOwnedBy(customerID string) bool { return m.CustomerID 
 type PaymentMethodRepository interface {
 	ListByCustomer(ctx context.Context, customerID string) ([]PaymentMethod, error)
 	GetByID(ctx context.Context, id string) (*PaymentMethod, error)
+	// Create stores the method; when it is the default, the previous default
+	// is cleared in the same transaction.
 	Create(ctx context.Context, method *PaymentMethod) error
 	Delete(ctx context.Context, id string) error
-	ClearDefault(ctx context.Context, customerID string) error
+}
+
+// CustomerRepository maps our customers to the provider's customer objects,
+// which saved cards are attached to.
+type CustomerRepository interface {
+	GetProviderCustomerID(ctx context.Context, customerID string) (string, error)
+	SaveProviderCustomerID(ctx context.Context, customerID, providerCustomerID string) error
 }
