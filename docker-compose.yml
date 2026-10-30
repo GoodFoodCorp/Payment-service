@@ -33,6 +33,22 @@ services:
       timeout: 5s
       retries: 5
 
+  # Stripe test mode, locally: forwards the account's webhooks to the service
+  # (Stripe cannot reach localhost). Opt-in: docker compose --profile stripe up -d
+  # Needs STRIPE_SECRET_KEY (sk_test_) in .env; copy the "whsec_" secret it
+  # prints at start into STRIPE_WEBHOOK_SECRET, then restart payment-service.
+  stripe-cli:
+    image: stripe/stripe-cli:v1.21.8
+    container_name: stripe-cli
+    profiles: ["stripe"]
+    restart: unless-stopped
+    command: >
+      listen --api-key ${STRIPE_SECRET_KEY:-}
+      --forward-to http://payment-service:8086/api/payments/webhooks/stripe
+      --events payment_intent.succeeded,payment_intent.payment_failed,payment_intent.canceled,charge.refunded
+    networks:
+      - microservices-net
+
 networks:
   microservices-net:
     external: true
