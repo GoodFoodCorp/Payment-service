@@ -45,6 +45,10 @@ func (f *FakeGateway) CreateCustomer(_ context.Context, customerID string) (stri
 	return "cus_fake_" + customerID, nil
 }
 
+func (f *FakeGateway) HasCustomer(_ context.Context, providerCustomerID string) (bool, error) {
+	return strings.HasPrefix(providerCustomerID, "cus_fake_"), nil
+}
+
 func (f *FakeGateway) CreateSetupIntent(_ context.Context, providerCustomerID string) (string, error) {
 	return "seti_fake_" + providerCustomerID + "_secret_fake", nil
 }

@@ -201,6 +201,9 @@ type PaymentGateway interface {
 	Refund(ctx context.Context, intentID, idempotencyKey string) error
 
 	CreateCustomer(ctx context.Context, customerID string) (string, error)
+	// HasCustomer reports whether the provider knows this customer: a mapping
+	// made in demo mode or with another provider account does not.
+	HasCustomer(ctx context.Context, providerCustomerID string) (bool, error)
 	// CreateSetupIntent lets the browser register a card directly with the
 	// provider; it returns the client secret.
 	CreateSetupIntent(ctx context.Context, providerCustomerID string) (string, error)

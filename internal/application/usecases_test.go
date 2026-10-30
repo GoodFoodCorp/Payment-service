@@ -17,15 +17,17 @@ var (
 )
 
 type fixture struct {
-	uc      *UseCases
-	repo    *fakeRepo
-	gw      *fakeGateway
-	methods *fakePaymentMethods
+	uc        *UseCases
+	repo      *fakeRepo
+	gw        *fakeGateway
+	methods   *fakePaymentMethods
+	customers *fakeCustomers
 }
 
 func setup() fixture {
-	f := fixture{repo: newFakeRepo(), gw: newFakeGateway(), methods: newFakePaymentMethods()}
-	f.uc = NewUseCases(f.repo, f.gw, f.methods, &fakeCustomers{ids: map[string]string{}})
+	f := fixture{repo: newFakeRepo(), gw: newFakeGateway(), methods: newFakePaymentMethods(),
+		customers: &fakeCustomers{ids: map[string]string{}}}
+	f.uc = NewUseCases(f.repo, f.gw, f.methods, f.customers)
 	return f
 }
 
@@ -276,6 +278,21 @@ func TestCreateCardSetup_CreatesProviderCustomerOnce(t *testing.T) {
 	_, err = f.uc.CreateCardSetup(ctx, customer)
 	require.NoError(t, err)
 	assert.Equal(t, 1, f.gw.customersMade)
+}
+
+func TestCreateCardSetup_ReplacesACustomerTheProviderDoesNotKnow(t *testing.T) {
+	f := setup()
+	// Mapped in demo mode (or with another provider account), with a card.
+	f.customers.ids[customer.UserID] = "legacy_" + customer.UserID
+	require.NoError(t, f.methods.Create(ctx, &domain.PaymentMethod{ID: "old-card", CustomerID: customer.UserID}))
+
+	secret, err := f.uc.CreateCardSetup(ctx, customer)
+
+	require.NoError(t, err)
+	assert.Equal(t, "seti_secret_cus_cust-1", secret)
+	assert.Equal(t, "cus_"+customer.UserID, f.customers.ids[customer.UserID])
+	cards, _ := f.uc.ListMyPaymentMethods(ctx, customer)
+	assert.Empty(t, cards, "cards of the unknown customer cannot be charged any more")
 }
 
 func TestAddPaymentMethod_OnlyCardsOfTheCallersAccount(t *testing.T) {

@@ -88,6 +88,11 @@ func (r *PaymentMethodRepository) Create(ctx context.Context, m *domain.PaymentM
 	return tx.Commit(ctx)
 }
 
+func (r *PaymentMethodRepository) DeleteAllOf(ctx context.Context, customerID string) error {
+	_, err := r.pool.Exec(ctx, `DELETE FROM payment_methods WHERE customer_id = $1`, customerID)
+	return err
+}
+
 func (r *PaymentMethodRepository) Delete(ctx context.Context, id string) error {
 	tag, err := r.pool.Exec(ctx, `DELETE FROM payment_methods WHERE id = $1`, id)
 	if err != nil {

@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"sort"
+	"strings"
 	"sync"
 
 	"goodfood/payment-service/internal/domain"
@@ -146,6 +147,15 @@ func (f *fakePaymentMethods) Create(_ context.Context, m *domain.PaymentMethod) 
 	return nil
 }
 
+func (f *fakePaymentMethods) DeleteAllOf(_ context.Context, customerID string) error {
+	for id, m := range f.items {
+		if m.CustomerID == customerID {
+			delete(f.items, id)
+		}
+	}
+	return nil
+}
+
 func (f *fakePaymentMethods) Delete(_ context.Context, id string) error {
 	delete(f.items, id)
 	return nil
@@ -155,6 +165,13 @@ type fakeCustomers struct{ ids map[string]string }
 
 func (f *fakeCustomers) GetProviderCustomerID(_ context.Context, customerID string) (string, error) {
 	return f.ids[customerID], nil
+}
+
+func (f *fakeCustomers) ReplaceProviderCustomerID(_ context.Context, customerID, stale, replacement string) error {
+	if f.ids[customerID] == stale {
+		f.ids[customerID] = replacement
+	}
+	return nil
 }
 
 func (f *fakeCustomers) SaveProviderCustomerID(_ context.Context, customerID, providerID string) error {
@@ -220,6 +237,10 @@ func (g *fakeGateway) Refund(_ context.Context, id, _ string) error {
 func (g *fakeGateway) CreateCustomer(_ context.Context, customerID string) (string, error) {
 	g.customersMade++
 	return "cus_" + customerID, g.err()
+}
+
+func (g *fakeGateway) HasCustomer(_ context.Context, providerCustomerID string) (bool, error) {
+	return strings.HasPrefix(providerCustomerID, "cus_"), g.err()
 }
 
 func (g *fakeGateway) CreateSetupIntent(_ context.Context, providerCustomerID string) (string, error) {

@@ -67,6 +67,9 @@ type PaymentMethodRepository interface {
 	// is cleared in the same transaction.
 	Create(ctx context.Context, method *PaymentMethod) error
 	Delete(ctx context.Context, id string) error
+	// DeleteAllOf removes a customer's saved cards (their provider customer
+	// was replaced: the cards belonged to the old one).
+	DeleteAllOf(ctx context.Context, customerID string) error
 }
 
 // CustomerRepository maps our customers to the provider's customer objects,
@@ -74,4 +77,7 @@ type PaymentMethodRepository interface {
 type CustomerRepository interface {
 	GetProviderCustomerID(ctx context.Context, customerID string) (string, error)
 	SaveProviderCustomerID(ctx context.Context, customerID, providerCustomerID string) error
+	// ReplaceProviderCustomerID swaps a stale mapping, only if it is still
+	// the stale one (a concurrent replacement wins).
+	ReplaceProviderCustomerID(ctx context.Context, customerID, stale, replacement string) error
 }
