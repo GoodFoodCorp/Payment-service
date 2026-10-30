@@ -76,7 +76,14 @@ func (uc *UseCases) ensureProviderCustomer(ctx context.Context, customerID strin
 		return "", err
 	}
 	if existing != "" {
-		return existing, nil
+		known, err := uc.gateway.HasCustomer(ctx, existing)
+		if err != nil {
+			return "", domain.NewGatewayError("payment provider error: " + err.Error())
+		}
+		if known {
+			return existing, nil
+		}
+		return uc.replaceProviderCustomer(ctx, customerID, existing)
 	}
 	created, err := uc.gateway.CreateCustomer(ctx, customerID)
 	if err != nil {
@@ -87,5 +94,23 @@ func (uc *UseCases) ensureProviderCustomer(ctx context.Context, customerID strin
 	}
 	// SaveProviderCustomerID keeps the first mapping on a concurrent insert:
 	// read it back so every caller uses the same provider customer.
+	return uc.customers.GetProviderCustomerID(ctx, customerID)
+}
+
+// replaceProviderCustomer gives the customer a provider customer again when
+// the stored one is unknown to the provider (created in demo mode, or with
+// another provider account). The cards saved with it cannot be charged any
+// more: they are removed, and the customer registers a card again.
+func (uc *UseCases) replaceProviderCustomer(ctx context.Context, customerID, stale string) (string, error) {
+	created, err := uc.gateway.CreateCustomer(ctx, customerID)
+	if err != nil {
+		return "", domain.NewGatewayError("payment provider error: " + err.Error())
+	}
+	if err := uc.customers.ReplaceProviderCustomerID(ctx, customerID, stale, created); err != nil {
+		return "", err
+	}
+	if err := uc.paymentMethods.DeleteAllOf(ctx, customerID); err != nil {
+		return "", err
+	}
 	return uc.customers.GetProviderCustomerID(ctx, customerID)
 }

@@ -5,6 +5,7 @@ package stripe
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -31,8 +32,23 @@ func NewClient(secretKey string) *Client {
 
 type apiError struct {
 	Error *struct {
+		Code    string `json:"code"`
 		Message string `json:"message"`
 	} `json:"error"`
+}
+
+// statusError is a non-2xx answer from Stripe.
+type statusError struct {
+	Status  int
+	Code    string
+	Message string
+}
+
+func (e *statusError) Error() string {
+	if e.Message == "" {
+		return fmt.Sprintf("stripe returned %d", e.Status)
+	}
+	return fmt.Sprintf("stripe %d: %s", e.Status, e.Message)
 }
 
 type intentResponse struct {
@@ -105,6 +121,21 @@ func (c *Client) CreateCustomer(ctx context.Context, customerID string) (string,
 		return "", err
 	}
 	return out.ID, nil
+}
+
+func (c *Client) HasCustomer(ctx context.Context, providerCustomerID string) (bool, error) {
+	var out struct {
+		Deleted bool `json:"deleted"`
+	}
+	err := c.do(ctx, http.MethodGet, "/customers/"+url.PathEscape(providerCustomerID), nil, "", &out)
+	var failure *statusError
+	if errors.As(err, &failure) && (failure.Status == http.StatusNotFound || failure.Code == "resource_missing") {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return !out.Deleted, nil
 }
 
 func (c *Client) CreateSetupIntent(ctx context.Context, providerCustomerID string) (string, error) {
@@ -185,11 +216,12 @@ func (c *Client) do(ctx context.Context, method, path string, form url.Values, i
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		failure := &statusError{Status: resp.StatusCode}
 		var apiErr apiError
 		if json.NewDecoder(resp.Body).Decode(&apiErr) == nil && apiErr.Error != nil {
-			return fmt.Errorf("stripe %d: %s", resp.StatusCode, apiErr.Error.Message)
+			failure.Code, failure.Message = apiErr.Error.Code, apiErr.Error.Message
 		}
-		return fmt.Errorf("stripe returned %d", resp.StatusCode)
+		return failure
 	}
 	if out == nil {
 		return nil

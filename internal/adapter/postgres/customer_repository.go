@@ -35,3 +35,10 @@ func (r *CustomerRepository) SaveProviderCustomerID(ctx context.Context, custome
 		 ON CONFLICT (customer_id) DO NOTHING`, customerID, providerCustomerID)
 	return err
 }
+
+func (r *CustomerRepository) ReplaceProviderCustomerID(ctx context.Context, customerID, stale, replacement string) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE payment_customers SET provider_customer_id = $3
+		 WHERE customer_id = $1 AND provider_customer_id = $2`, customerID, stale, replacement)
+	return err
+}
