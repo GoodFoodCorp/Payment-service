@@ -236,7 +236,7 @@ func TestHandleProviderEvent_IgnoresUnknownIntent(t *testing.T) {
 
 // ── Customer reads ──────────────────────────────────────────
 
-func TestOnlyOwnerOrAdminCanView(t *testing.T) {
+func TestOnlyTheOwnerCanView(t *testing.T) {
 	f := setup()
 	_, _ = f.uc.CreateIntentForOrder(ctx, intentFor("order-1", 1000))
 
@@ -246,7 +246,7 @@ func TestOnlyOwnerOrAdminCanView(t *testing.T) {
 	_, err = f.uc.GetPayment(ctx, customer, "order-1")
 	require.NoError(t, err)
 	_, err = f.uc.GetPayment(ctx, Actor{UserID: "adm", RoleSlugs: []string{RoleAdmin}}, "order-1")
-	require.NoError(t, err)
+	requireCode(t, err, domain.ErrCodeForbidden)
 }
 
 func TestListMyPayments_IsPaginated(t *testing.T) {

@@ -6,13 +6,14 @@ import (
 	"goodfood/payment-service/internal/domain"
 )
 
-// GetPayment returns the payment of an order, for its owner or head office.
+// GetPayment returns the payment of an order, to the customer who made it
+// only (head office sees no customer's order).
 func (uc *UseCases) GetPayment(ctx context.Context, actor Actor, orderID string) (*domain.Payment, error) {
 	payment, err := uc.payments.GetByOrderID(ctx, orderID)
 	if err != nil {
 		return nil, err
 	}
-	if !payment.IsOwnedBy(actor.UserID) && !actor.HasRole(RoleAdmin) {
+	if !payment.IsOwnedBy(actor.UserID) {
 		return nil, domain.NewForbiddenError("you are not allowed to view this payment")
 	}
 	return payment, nil
